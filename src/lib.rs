@@ -1,17 +1,20 @@
 use serde::Serialize;
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr2};
+use std::fmt;
 
-// --- TỐI ƯU HÓA "ALL-IN" ---
+// --- OPTIMIZATIONS ---
 use bumpalo::{
     Bump, 
     collections::Vec as BumpVec,
-    collections::String as BumpString, // 1. Dùng String của Bumpalo (Arena)
+    collections::String as BumpString, // 1. Use Bumpalo's String (Arena)
 };
 use hashbrown::HashMap as BumpHashMap;
 use ahash::RandomState as AHasher;
-// --- KẾT THÚC KẾ HOẠCH ---
 
-// --- Cấu trúc dữ liệu ---
+use serde_json::{Value as JsonValue, Number as JsonNumber, Map as JsonMap};
+// --- END OPTIMIZATION PLAN ---
+
+// --- Data Structures ---
 
 /// Represents a numeric value (Integer or Float)
 #[derive(Debug, Serialize, PartialEq)]
@@ -28,97 +31,48 @@ pub enum FdonValue<'a, 'bump> {
     Null,
     Bool(bool),
     Number(FdonNumber), // N...
-    Timestamp(FdonNumber), // T... (dạng số)
+    Timestamp(FdonNumber), // T... (numeric format)
     RawString(&'a str), // S"..."
     EscapedString(BumpString<'bump>), // SE"..."
     Date(&'a str), // D"..."
-    Time(&'a str), // T"..." (dạng chuỗi)
+    Time(&'a str), // T"..." (string format)
     Array(BumpVec<'bump, FdonValue<'a, 'bump>>),
     Object(BumpHashMap<&'a str, FdonValue<'a, 'bump>, AHasher, &'bump Bump>),
 }
 
-/// Parse Error type
-pub type FdonParseError = (String, usize);
-pub type ParseResult<'a, 'bump, T> = Result<T, FdonParseError>;
-
-// --- Minify Function (Giữ nguyên) ---
-
-#[inline(always)]
-pub fn minify_fdon(input: &str) -> String {
-    let input_bytes = input.as_bytes();
-    let mut minified = Vec::with_capacity(input.len());
-    let mut in_string_s = false; // Dùng cho S"..."
-    let mut in_string_se = false; // Dùng cho SE"..."
-
-    let mut i = 0;
-    while i < input_bytes.len() {
-        let byte = input_bytes[i];
-        
-        // Logic cho S"..." (Raw String)
-        if byte == b'"' && !in_string_se {
-             // Kiểm tra xem có phải là S" (start) hay D" hoặc T"
-            if !in_string_s && i > 0 {
-                let prefix = input_bytes[i-1];
-                if prefix == b'S' || prefix == b'D' || prefix == b'T' {
-                     in_string_s = true;
-                }
-            } else {
-                 in_string_s = false;
-            }
-            minified.push(byte);
-            i += 1;
-            continue;
-        }
-
-        // Logic cho SE"..." (Escaped String)
-        if byte == b'S' && i + 1 < input_bytes.len() && input_bytes[i+1] == b'E' {
-             minified.push(b'S');
-             minified.push(b'E');
-             i += 2;
-             
-             // Tìm " mở đầu
-             while i < input_bytes.len() && (input_bytes[i] == b' ' || input_bytes[i] == b'\t' || input_bytes[i] == b'\n' || input_bytes[i] == b'\r') {
-                 i += 1;
-             }
-             if i < input_bytes.len() && input_bytes[i] == b'"' {
-                 minified.push(b'"');
-                 i += 1;
-                 in_string_se = true;
-                 
-                 // Copy y hệt cho đến khi gặp " đóng (không bị escape)
-                 while i < input_bytes.len() {
-                     let se_byte = input_bytes[i];
-                     minified.push(se_byte);
-                     i += 1;
-                     
-                     if se_byte == b'\\' && i < input_bytes.len() {
-                         // Nếu là escape (\\ hoặc \") thì copy cả ký tự sau
-                         minified.push(input_bytes[i]);
-                         i += 1;
-                     } else if se_byte == b'"' {
-                         // Dấu " không bị escape -> kết thúc SE
-                         in_string_se = false;
-                         break;
-                     }
-                 }
-             }
-             continue;
-        }
-
-        // Bỏ qua whitespace nếu không ở trong chuỗi nào cả
-        if (byte == b' ' || byte == b'\n' || byte == b'\r' || byte == b'\t') && !in_string_s && !in_string_se {
-            i += 1;
-            continue;
-        }
-
-        // Giữ lại các ký tự khác
-        minified.push(byte);
-        i += 1;
-    }
-    
-    unsafe { String::from_utf8_unchecked(minified) }
+/// Parse Error type with coordinate information
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FdonError {
+    pub message: String,
+    pub index: usize,
+    pub row: usize,
+    pub column: usize,
 }
 
+impl fmt::Display for FdonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} at row {}, column {} (index {})", self.message, self.row, self.column, self.index)
+    }
+}
+
+impl std::error::Error for FdonError {}
+
+pub type ParseResult<T> = Result<T, FdonError>;
+
+#[inline]
+fn index_to_coord(data: &[u8], index: usize) -> (usize, usize) {
+    let mut row = 1;
+    let mut col = 1;
+    for &b in data.iter().take(index) {
+        if b == b'\n' {
+            row += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
 
 // --- Parser ---
 
@@ -138,7 +92,18 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
         }
     }
 
-    // --- Helpers (Không đổi) ---
+    #[inline(always)]
+    fn err<T>(&self, message: impl Into<String>, index: usize) -> ParseResult<T> {
+        let (row, column) = index_to_coord(self.data, index);
+        Err(FdonError {
+            message: message.into(),
+            index,
+            row,
+            column,
+        })
+    }
+
+    // --- Helpers ---
     #[inline(always)]
     fn peek(&self) -> Option<u8> {
         self.data.get(self.index).copied()
@@ -148,38 +113,57 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
     fn advance(&mut self) {
         self.index += 1;
     }
+    
+    #[inline(always)]
+    fn skip_whitespace(&mut self) {
+        while let Some(b) = self.peek() {
+            if b.is_ascii_whitespace() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
 
     #[inline(always)]
-    fn consume(&mut self, char: u8) -> ParseResult<'a, 'bump, ()> {
+    fn consume(&mut self, char: u8) -> ParseResult<()> {
         if self.peek() == Some(char) {
             self.advance();
             Ok(())
         } else {
             let found = self.peek().map(|c| c as char).map(|c| c.to_string()).unwrap_or_else(|| "EOF".to_string());
-            Err((
-                format!("Expected '{}' but found '{}'", char as char, found),
-                self.index,
-            ))
+            self.err(format!("Expected '{}' but found '{}'", char as char, found), self.index)
         }
     }
 
     // --- Parse Logic ---
     #[inline(always)]
-    pub fn parse(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    pub fn parse(&mut self) -> ParseResult<FdonValue<'a, 'bump>> {
+        self.skip_whitespace();
+        if self.index == self.data.len() {
+            return self.err("Empty input", self.index);
+        }
         let value = self.parse_value()?;
+        self.skip_whitespace();
         if self.index != self.data.len() {
-            Err((
-                "Extra data detected at end of file".to_string(),
-                self.index,
-            ))
+            self.err("Extra data detected at end of file", self.index)
         } else {
             Ok(value)
         }
     }
 
     #[inline(always)]
-    fn parse_value(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
-        let type_char = self.peek().ok_or(("Unexpected EOF".to_string(), self.index))?;
+    fn parse_value(&mut self) -> ParseResult<FdonValue<'a, 'bump>> {
+        self.skip_whitespace();
+        let type_char = self.peek().ok_or_else(|| {
+            let (row, column) = index_to_coord(self.data, self.index);
+            FdonError {
+                message: "Unexpected EOF".to_string(),
+                index: self.index,
+                row,
+                column,
+            }
+        })?;
         self.advance(); 
 
         match type_char {
@@ -190,17 +174,23 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
                 // Check for SE"..." (Escaped String)
                 if self.peek() == Some(b'E') {
                     self.advance(); // consume 'E'
+                    self.skip_whitespace();
                     self.parse_escaped_string()
                 } else {
                     // S"..." (Raw String)
+                    self.skip_whitespace();
                     self.parse_raw_string(FdonValue::RawString)
                 }
             }
             
-            b'D' => self.parse_raw_string(FdonValue::Date), // D"..."
+            b'D' => {
+                self.skip_whitespace();
+                self.parse_raw_string(FdonValue::Date) // D"..."
+            }
             
             b'T' => {
-                // T (Đa hình): Có thể là T"..." (String) hoặc T... (Number)
+                // T (Polymorphic): Could be T"..." (String) or T... (Number)
+                self.skip_whitespace();
                 if self.peek() == Some(b'"') {
                     // T"..." -> String path
                     self.parse_raw_string(FdonValue::Time)
@@ -213,6 +203,7 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
 
             b'N' => {
                 // N... -> Number path
+                self.skip_whitespace();
                 self.parse_number_internal()
                     .map(FdonValue::Number) // Wrap in Number
             }
@@ -220,75 +211,88 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
             b'B' => self.parse_boolean(),
             b'U' => Ok(FdonValue::Null),
             
-            _ => Err((
-                format!("Unknown data type specifier '{}'", type_char as char),
-                self.index - 1,
-            )),
+            _ => self.err(format!("Unknown data type specifier '{}'", type_char as char), self.index - 1),
         }
     }
 
-    // --- Parse Object (TỐI ƯU HÓA "ALL-IN") ---
-    fn parse_object(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    // --- Parse Object ---
+    fn parse_object(&mut self) -> ParseResult<FdonValue<'a, 'bump>> {
         let hasher = AHasher::new();
         let mut obj = BumpHashMap::with_hasher_in(hasher, self.arena);
         
         self.consume(b'{')?;
+        self.skip_whitespace();
 
         while self.peek() != Some(b'}') {
             let key = self.parse_key()?;
+            self.skip_whitespace();
             self.consume(b':')?;
+            self.skip_whitespace();
             let value = self.parse_value()?;
             obj.insert(key, value);
 
+            self.skip_whitespace();
             if self.peek() == Some(b',') {
                 self.advance();
+                self.skip_whitespace();
                 if self.peek() == Some(b'}') {
-                    return Err(("Trailing comma detected in object".to_string(), self.index));
+                    return self.err("Trailing comma detected in object", self.index);
                 }
             } else if self.peek() != Some(b'}') {
-                return Err(("Missing comma or '}' in object".to_string(), self.index));
+                return self.err("Missing comma or '}' in object", self.index);
             }
         }
         self.consume(b'}')?;
         Ok(FdonValue::Object(obj))
     }
 
-    // --- Parse Key (Không đổi) ---
+    // --- Parse Key ---
     #[inline(always)]
-    fn parse_key(&mut self) -> ParseResult<'a, 'bump, &'a str> {
+    fn parse_key(&mut self) -> ParseResult<&'a str> {
         let start = self.index;
-        let remaining_data = &self.data[self.index..];
+        let mut end_key = start;
+        let mut found_colon = false;
 
-        match memchr(b':', remaining_data) {
-            Some(pos) => {
-                let end = self.index + pos;
-                let key_slice = &self.data[start..end];
-                self.index = end; 
-
-                unsafe {
-                    Ok(std::str::from_utf8_unchecked(key_slice))
-                }
+        while self.index < self.data.len() {
+            let b = self.data[self.index];
+            if b == b':' {
+                found_colon = true;
+                break;
+            } else if !b.is_ascii_whitespace() {
+                end_key = self.index + 1; // track the end of non-whitespace char for the key
             }
-            None => Err(("EOF while reading key (':' not found)".to_string(), self.index)),
+            self.index += 1;
+        }
+
+        if found_colon {
+            let key_slice = &self.data[start..end_key];
+            unsafe {
+                Ok(std::str::from_utf8_unchecked(key_slice))
+            }
+        } else {
+            self.err("EOF while reading key (':' not found)", self.index)
         }
     }
 
-    // --- Parse Array (Đã tối ưu với BumpVec) ---
-    fn parse_array(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    // --- Parse Array ---
+    fn parse_array(&mut self) -> ParseResult<FdonValue<'a, 'bump>> {
         let mut arr = BumpVec::new_in(self.arena);
         
         self.consume(b'[')?;
+        self.skip_whitespace();
 
         while self.peek() != Some(b']') {
             arr.push(self.parse_value()?);
 
+            self.skip_whitespace();
             if self.peek() == Some(b',') {
                 self.advance();
+                self.skip_whitespace();
                 if self.peek() == Some(b']') {
-                    return Err(("Trailing comma detected in array".to_string(), self.index));
+                    return self.err("Trailing comma detected in array", self.index);
                 }
             } else if self.peek() != Some(b']') {
-                return Err(("Missing comma or ']' in array".to_string(), self.index));
+                return self.err("Missing comma or ']' in array", self.index);
             }
         }
         self.consume(b']')?;
@@ -300,7 +304,7 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
     fn parse_raw_string(
         &mut self, 
         constructor: fn(&'a str) -> FdonValue<'a, 'bump>
-    ) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    ) -> ParseResult<FdonValue<'a, 'bump>> {
         self.consume(b'"')?;
         let start = self.index;
         let remaining_data = &self.data[self.index..];
@@ -312,57 +316,56 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
                 
                 self.index = end + 1; 
 
-                // SỬA LỖI: std.str:: -> std::str::
                 let val_str = unsafe { std::str::from_utf8_unchecked(val_slice) };
                 
                 Ok(constructor(val_str))
             }
-            None => Err(("EOF while reading string ('\"' not found)".to_string(), start)),
+            None => self.err("EOF while reading string ('\"' not found)", start),
         }
     }
     
     // --- Parse Escaped String (SE"...") ---
-    fn parse_escaped_string(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    fn parse_escaped_string(&mut self) -> ParseResult<FdonValue<'a, 'bump>> {
         self.consume(b'"')?;
         
-        // Dùng String của Bumpalo để chứa kết quả unescape
+        // Use Bumpalo's String to hold unescaped result
         let mut unescaped_str = BumpString::new_in(self.arena);
         
         let mut start_chunk = self.index;
 
-        // Tối ưu: Dùng memchr2 để tìm \ hoặc " (kết thúc)
+        // Optimize: Use memchr2 to find \ or " (end)
         while let Some(pos) = memchr2(b'\\', b'"', &self.data[self.index..]) {
             
             let found_char = self.data[self.index + pos];
             
             if found_char == b'"' {
-                // --- KẾT THÚC CHUỖI ---
+                // --- END OF STRING ---
                 let end = self.index + pos;
                 let chunk_slice = &self.data[start_chunk..end];
                 
-                // Thêm chunk cuối cùng (nếu có)
+                // Add the last chunk (if any)
                 if !chunk_slice.is_empty() {
                     unescaped_str.push_str(unsafe { std::str::from_utf8_unchecked(chunk_slice) });
                 }
                 
-                self.index = end + 1; // Bỏ qua "
+                self.index = end + 1; // Skip "
                 return Ok(FdonValue::EscapedString(unescaped_str));
             }
 
             if found_char == b'\\' {
-                // --- KÝ TỰ ESCAPE ---
+                // --- ESCAPE CHARACTER ---
                 
-                // 1. Thêm chunk an toàn trước đó
+                // 1. Add the previous safe chunk
                 let end_chunk = self.index + pos;
                 let chunk_slice = &self.data[start_chunk..end_chunk];
                 if !chunk_slice.is_empty() {
                     unescaped_str.push_str(unsafe { std::str::from_utf8_unchecked(chunk_slice) });
                 }
                 
-                // 2. Bỏ qua dấu \
+                // 2. Skip the \ character
                 self.index = end_chunk + 1;
                 
-                // 3. Xử lý ký tự được escape
+                // 3. Process the escaped character
                 match self.peek() {
                     Some(b'n') => unescaped_str.push('\n'),
                     Some(b't') => unescaped_str.push('\t'),
@@ -370,63 +373,78 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
                     Some(b'"') => unescaped_str.push('\"'),
                     Some(b'\\') => unescaped_str.push('\\'),
                     Some(other) => {
-                        // Ký tự escape không hợp lệ, chỉ giữ lại ký tự đó
-                        // (ví dụ: \a -> a)
+                        // Invalid escape character, just keep it as is
+                        // (e.g., \a -> a)
                          unescaped_str.push(other as char);
                     }
-                    None => return Err(("EOF after escape character '\\'".to_string(), self.index)),
+                    None => return self.err("EOF after escape character '\\'", self.index),
                 }
                 
-                // 4. Advance và reset chunk
+                // 4. Advance and reset chunk
                 self.advance();
                 start_chunk = self.index;
             }
         }
 
-        // Nếu không tìm thấy " (lỗi EOF)
-        Err(("EOF while reading escaped string ('\"' not found)".to_string(), self.index))
+        // If " is not found (EOF error)
+        self.err("EOF while reading escaped string ('\"' not found)", self.index)
     }
 
-
-    // --- Parse Number Internal (Sử dụng cho cả N và T) ---
+    // --- Parse Number Internal (Used for both N and T) ---
     #[inline(always)]
-    fn parse_number_internal(&mut self) -> ParseResult<'a, 'bump, FdonNumber> {
+    fn parse_number_internal(&mut self) -> ParseResult<FdonNumber> {
         let start = self.index;
-        let remaining_data = &self.data[self.index..];
+        let mut iter_idx = self.index;
+        let mut has_float = false;
 
-        let end;
-        match memchr3(b',', b'}', b']', remaining_data) {
-            Some(pos) => {
-                end = self.index + pos;
-                self.index = end; 
+        while iter_idx < self.data.len() {
+            let b = self.data[iter_idx];
+            if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() {
+                break;
             }
-            None => {
-                end = self.data.len();
-                self.index = end;
+            if b == b'.' {
+                has_float = true;
             }
+            iter_idx += 1;
         }
 
-        let num_slice = &self.data[start..end];
+        let num_slice = &self.data[start..iter_idx];
+        self.index = iter_idx; // Advance index
+
         if num_slice.is_empty() {
-            return Err(("Empty number value".to_string(), self.index));
+            return self.err("Empty number value", self.index);
         }
-        
-        let is_float = memchr(b'.', num_slice).is_some();
 
-        if is_float {
+        if has_float {
             let val: f64 = fast_float::parse(num_slice)
-                .map_err(|e| (format!("Invalid float format: {}", e), start))?;
+                .map_err(|e| {
+                    let (row, column) = index_to_coord(self.data, start);
+                    FdonError {
+                        message: format!("Invalid float format: {}", e),
+                        index: start,
+                        row,
+                        column,
+                    }
+                })?;
             Ok(FdonNumber::Float(val))
         } else {
             let val: i64 = atoi::atoi(num_slice)
-                .ok_or(("Invalid integer format or out of range".to_string(), start))?;
+                .ok_or_else(|| {
+                    let (row, column) = index_to_coord(self.data, start);
+                    FdonError {
+                        message: "Invalid integer format or out of range".to_string(),
+                        index: start,
+                        row,
+                        column,
+                    }
+                })?;
             Ok(FdonNumber::Integer(val))
         }
     }
 
-    // --- Parse Boolean (Không đổi) ---
+    // --- Parse Boolean ---
     #[inline(always)]
-    fn parse_boolean(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    fn parse_boolean(&mut self) -> ParseResult<FdonValue<'a, 'bump>> {
         if self.data.get(self.index..self.index + 4) == Some(b"true") {
             self.index += 4;
             Ok(FdonValue::Bool(true))
@@ -434,19 +452,58 @@ impl<'a, 'bump> FdonParser<'a, 'bump> {
             self.index += 5;
             Ok(FdonValue::Bool(false))
         } else {
-            Err(("Invalid boolean value".to_string(), self.index))
+            self.err("Invalid boolean value", self.index)
         }
     }
 }
 
+// --- Public APIs ---
 
-// --- Public API Functions (Chỉ dùng Arena) ---
-
+/// Parses FDON text allocating to a provided Bumpalo Arena (Zero-Copy where possible).
 #[inline]
 pub fn parse_fdon_zero_copy_arena<'a, 'bump>(
-    minified_data: &'a str,
+    input: &'a str,
     arena: &'bump Bump
-) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
-    let mut parser = FdonParser::new(minified_data, arena);
+) -> ParseResult<FdonValue<'a, 'bump>> {
+    let mut parser = FdonParser::new(input, arena);
     parser.parse()
+}
+
+/// Parses FDON text directly into a standard serde_json::Value.
+/// This hides the Bumpalo arena complexity from the user.
+#[inline]
+pub fn parse_fdon(input: &str) -> Result<JsonValue, FdonError> {
+    let arena = Bump::new();
+    let val = parse_fdon_zero_copy_arena(input, &arena)?;
+    Ok(fdon_to_json(val))
+}
+
+/// Helper to convert zero-copy FdonValue to owned serde_json::Value
+fn fdon_to_json(val: FdonValue<'_, '_>) -> JsonValue {
+    match val {
+        FdonValue::Null => JsonValue::Null,
+        FdonValue::Bool(b) => JsonValue::Bool(b),
+        FdonValue::Number(n) | FdonValue::Timestamp(n) => match n {
+            FdonNumber::Integer(i) => JsonValue::Number(JsonNumber::from(i)),
+            FdonNumber::Float(f) => JsonNumber::from_f64(f).map(JsonValue::Number).unwrap_or(JsonValue::Null),
+        },
+        FdonValue::RawString(s) => JsonValue::String(s.to_string()),
+        FdonValue::EscapedString(s) => JsonValue::String(s.as_str().to_string()),
+        FdonValue::Date(s) => JsonValue::String(s.to_string()),
+        FdonValue::Time(s) => JsonValue::String(s.to_string()),
+        FdonValue::Array(arr) => {
+            let mut j_arr = Vec::with_capacity(arr.len());
+            for item in arr {
+                j_arr.push(fdon_to_json(item));
+            }
+            JsonValue::Array(j_arr)
+        }
+        FdonValue::Object(obj) => {
+            let mut j_map = JsonMap::with_capacity(obj.len());
+            for (k, v) in obj {
+                j_map.insert(k.to_string(), fdon_to_json(v));
+            }
+            JsonValue::Object(j_map)
+        }
+    }
 }

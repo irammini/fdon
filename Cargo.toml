@@ -13,11 +13,11 @@ repository = "https://github.com/irammini/fdon"
 keywords = ["fdon", "parser", "zero-copy", "serialization", "high-performance"]
 categories = ["data-structures", "parsing", "encoding"]
 
-# --- EXCLUDE FILES FOR CRATE PACKAGING (Tối ưu kích thước) ---
+# --- EXCLUDE FILES FOR CRATE PACKAGING (Optimize size) ---
 exclude = [
     "main.rs",
     "tests/*",
-    "*.fdon" # Ví dụ file FDON
+    "*.fdon" # Example FDON file
 ]
 
 # --- DEPENDENCIES ---
@@ -26,19 +26,19 @@ memchr = "2.7.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# --- TỐI ƯU HÓA PARSE SỐ (Giữ nguyên) ---
+# --- NUMBER PARSING OPTIMIZATIONS ---
 fast-float = "0.2.0"
 atoi = "2.0.0"
 
-# --- TỐI ƯU HÓA "ALL-IN" (Kế hoạch cuối cùng) ---
+# --- OPTIMIZATIONS ---
 
 # 1. Bumpalo (Arena + Vec)
-# Thêm 'allocator-api2' để nó có thể "nói chuyện" với hashbrown
+# Add 'allocator-api2' so it can communicate with hashbrown
 bumpalo = { version = "3.16.0", features = ["collections", "serde", "allocator-api2"] }
 
-# 2. Hashbrown (HashMap nhanh)
-# Thêm 'allocator-api2' để nó nhận diện Bumpalo
+# 2. Hashbrown (Fast HashMap)
+# Add 'allocator-api2' to recognize Bumpalo
 hashbrown = { version = "0.14.5", features = ["serde", "allocator-api2"] }
 
-# 3. AHash (Hasher nhanh)
+# 3. AHash (Fast Hasher)
 ahash = { version = "0.8.11", features = ["serde"] }

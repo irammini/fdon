@@ -3,33 +3,28 @@ use std::fs;
 use std::process;
 use std::time::Instant;
 
-// --- SỬA LỖI API ---
-// Import API mới (chỉ dùng Arena) và các struct liên quan
-use fdon_rs::{minify_fdon, FdonParseError, FdonValue, parse_fdon_zero_copy_arena};
-// Import Bumpalo
-use bumpalo::Bump;
-// --- KẾT THÚC SỬA LỖI ---
+// Import the new ergonomic API and Error structure
+use fdon::{parse_fdon, FdonError};
 
-
-// Hàm trợ giúp in lỗi (Giờ sẽ in lỗi trên file thô)
-fn print_error((msg, pos): FdonParseError, raw_content: &str) -> ! {
-    eprintln!("FDON Syntax Error: {} at position {}", msg, pos);
+// Helper function to print error with context
+fn print_error(error: FdonError, raw_content: &str) -> ! {
+    eprintln!("FDON Syntax Error: {}", error);
     
-    // Chỉ in một phần của nội dung nếu nó quá dài
+    // Only print a part of the content if it's too long
     const MAX_LEN: usize = 100;
     if raw_content.len() > MAX_LEN {
-         let start = if pos > MAX_LEN / 2 { pos - MAX_LEN / 2 } else { 0 };
+         let start = if error.index > MAX_LEN / 2 { error.index - MAX_LEN / 2 } else { 0 };
          let end = std::cmp::min(raw_content.len(), start + MAX_LEN);
          eprintln!("...{}...", &raw_content[start..end]);
-         // Tính toán vị trí ^
-         if pos >= start {
-            eprintln!("{}^", " ".repeat(pos - start));
+         // Calculate ^ position
+         if error.index >= start {
+            eprintln!("{}^", " ".repeat(error.index - start));
          } else {
             eprintln!("^ (Error at start)");
          }
     } else {
         eprintln!("{}", raw_content);
-        eprintln!("{}^", " ".repeat(pos));
+        eprintln!("{}^", " ".repeat(error.index));
     }
     
     process::exit(1);
@@ -53,34 +48,23 @@ fn main() {
         }
     };
 
-    // --- Bước 1: Minify (Đo thời gian riêng) ---
-    let start_time_minify = Instant::now();
-    let minified_content = minify_fdon(&content);
-    let duration_minify = start_time_minify.elapsed();
-    
     println!("--- FDON Process Timing ---");
-    println!("Minified Data Size: {} bytes", minified_content.len());
-    println!("Minify Time: {:.6} ms", duration_minify.as_secs_f64() * 1000.0);
+    println!("Data Size: {} bytes", content.len());
     println!("{}", "-".repeat(30));
 
-
-    // --- Bước 2: Parse (Sử dụng Arena) ---
-    
-    // TẠO ARENA
-    let arena = Bump::new();
+    // --- High-level Parse (Zero-Copy internal with API Ergonomics) ---
     
     let start_time_parse = Instant::now();
     
-    // 'value' giờ đây mượn 'minified_content' (cho 'a) VÀ 'arena' (cho 'bump)
-    let value: FdonValue<'_, '_> = match parse_fdon_zero_copy_arena(&minified_content, &arena) {
+    // 'value' is a standard serde_json::Value without lifetime issues
+    let value = match parse_fdon(&content) {
         Ok(v) => v,
-        // In lỗi trên nội dung ĐÃ MINIFY (vì index lỗi là trên file đó)
-        Err(e) => print_error(e, &minified_content),
+        Err(e) => print_error(e, &content),
     };
 
     let duration_parse = start_time_parse.elapsed(); 
 
-    // --- Serialization và In kết quả ---
+    // --- Serialization and Output ---
     let start_time_serialize = Instant::now();
 
     let json_output = serde_json::to_string(&value)
@@ -95,16 +79,13 @@ fn main() {
     println!("Total JSON size: {} bytes", json_output.len());
     println!("{}", "-".repeat(30));
     
-    // Tính toán và in tốc độ
+    // Calculate and print speed
     let duration_parse_ms = duration_parse.as_secs_f64() * 1000.0;
     let duration_serialize_ms = duration_serialize.as_secs_f64() * 1000.0;
     
     println!("--- FDON Process Timing (Summary) ---");
-    // (Lưu ý: Thời gian Parse này KHÔNG bao gồm Minify)
-    println!("🚀 Parse Time (Arena, Zero-Copy): {:.6} ms", duration_parse_ms);
-    println!("⚡ Serialize Time (minified): {:.6} ms", duration_serialize_ms);
+    println!("🚀 Parse Time (API Ergonomics Wrapper): {:.6} ms", duration_parse_ms);
+    println!("⚡ Serialize Time: {:.6} ms", duration_serialize_ms);
     println!("Total Time (Parse + Serialize): {:.6} ms", duration_parse_ms + duration_serialize_ms);
     println!("{}", "-".repeat(30));
-
-    // Arena sẽ tự động được giải phóng khi 'arena' ra khỏi scope
 }
