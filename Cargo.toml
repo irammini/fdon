@@ -1,5 +1,5 @@
 [package]
-name = "fdon-rs"
+name = "fdon"
 version = "0.3.0"
 edition = "2024"
 
@@ -7,9 +7,9 @@ edition = "2024"
 
 description = "A high-performance, zero-copy, and minified data format (FDON) parser for Rust, leveraging SIMD for read speed."
 license = "Apache-2.0" 
-authors = ["Teaserverse <contact@teaserverse.online>"] 
+authors = ["irammini <me@teaserverse.online>"] 
 readme = "README.md"
-repository = "https://github.com/TeaserLang/fdon-rs" 
+repository = "https://github.com/irammini/fdon" 
 keywords = ["fdon", "parser", "zero-copy", "serialization", "high-performance"]
 categories = ["data-structures", "parsing", "encoding"]
 
